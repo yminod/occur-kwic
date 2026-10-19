@@ -1,0 +1,9 @@
+# Emacs generated files
+*.elc
+*.eln
+*~
+\#*#
+.\#*
+
+# macOS metadata
+.DS_Store
