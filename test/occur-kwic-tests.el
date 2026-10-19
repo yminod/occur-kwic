@@ -1,4 +1,8 @@
 ;;; occur-kwic-tests.el --- KWIC behavior tests -*- lexical-binding: t; -*-
+
+;; Author: Minoru Yasui
+;; Assisted-by: Codex:GPT-6.1
+
 (require 'ert)
 (require 'cl-lib)
 (require 'occur-kwic)

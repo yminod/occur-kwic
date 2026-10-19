@@ -79,7 +79,36 @@ Use `occur-kwic-hook` for actions after a successful search. Mode initialization
 
 ## Development
 
-With Emacs and GNU Make installed, run these commands from this repository:
+The test entry points need Emacs and either a POSIX shell or PowerShell. GNU Make is optional. Run these commands from this repository.
+
+On macOS, Linux, or another POSIX environment:
+
+```sh
+./scripts/test.sh
+./scripts/test.sh --test-only
+EMACS='/path/with spaces/to/emacs' ./scripts/test.sh
+```
+
+The shell script uses POSIX `sh` syntax and works with macOS's system shell and Bash 3.2; it does not require a newer Bash.
+
+On Windows, or any system with PowerShell installed:
+
+```powershell
+pwsh -NoProfile -File ./scripts/test.ps1
+pwsh -NoProfile -File ./scripts/test.ps1 -TestOnly
+pwsh -NoProfile -File ./scripts/test.ps1 -Emacs 'C:\Program Files\Emacs\bin\emacs.exe'
+```
+
+Use `emacs.exe`, rather than `runemacs.exe`, for batch checks on Windows. Both entry points accept an `EMACS` environment variable; PowerShell's `-Emacs` parameter overrides it. They locate the repository relative to the script, so they can also be invoked by path from another working directory. The process exit code is zero on success and nonzero on failure.
+
+Both scripts call the same Emacs Lisp runner. You can also invoke it directly:
+
+```sh
+emacs -Q --batch -l scripts/run-tests.el
+emacs -Q --batch -l scripts/run-tests.el --test-only
+```
+
+The existing Make targets use the POSIX entry point:
 
 ```sh
 make check
@@ -87,7 +116,7 @@ make test                       # ERT tests only
 make check EMACS=/path/to/emacs  # Use a different Emacs
 ```
 
-`make check` checks parentheses, loads both implementations, byte-compiles with warnings treated as errors, and runs ERT. Compilation uses a temporary directory and removes its artifacts.
+The default run checks parentheses, loads both implementations, byte-compiles with warnings treated as errors, and runs ERT. Compilation uses a temporary directory and removes its artifacts. Test-only runs skip source checks and compilation.
 
 The current suite has 39 tests: 22 passing tests for the new implementation, plus 17 legacy characterization tests with 15 passes and 2 expected failures. The expected failures record legacy tab alignment and zero-width search progress; separate passing tests cover the fixes in `occur-kwic`. A successful run reports `39 results as expected, 0 unexpected` and `2 expected failures`.
 

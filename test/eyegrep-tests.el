@@ -1,5 +1,8 @@
 ;;; eyegrep-tests.el --- Characterize the original eyegrep -*- lexical-binding: t; -*-
 
+;; Author: Minoru Yasui
+;; Assisted-by: Codex:GPT-6.1
+
 ;; These tests describe the existing implementation, not the proposed
 ;; occur-kwic API.  Expected failures describe known defects separately.
 

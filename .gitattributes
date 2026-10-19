@@ -1,0 +1,2 @@
+# Keep the POSIX entry point runnable after a Windows checkout.
+*.sh text eol=lf

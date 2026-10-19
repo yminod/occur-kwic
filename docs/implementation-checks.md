@@ -8,6 +8,14 @@ Recorded on 2026-10-20 for [occur-kwic.el](../occur-kwic.el). The legacy impleme
 
 The new tests observe result text, window-specific display properties, source markers, and ordinary Occur navigation. They do not simply duplicate the layout formula as their expected-value calculation.
 
+## Portable test entry points
+
+`scripts/test.sh` and `scripts/test.ps1` invoke the shared `scripts/run-tests.el` runner. The default runs source checks and ERT; `--test-only` (POSIX) or `-TestOnly` (PowerShell) runs ERT alone. The Make targets use the POSIX entry point.
+
+Both entry points completed all 39 tests as expected on macOS. Additional checks covered macOS's `/bin/sh` and Bash 3.2, invocation outside the repository, repository and Emacs executable paths containing spaces, an explicit PowerShell `-Emacs` parameter overriding the environment, and propagation of a simulated Emacs failure with exit code 23. Unknown runner arguments returned a nonzero exit code. The original `eyegrep.el` SHA-256 remains `4b7beda35bee6557fc0e19850d5c0bd4bd4e5460c915c20115ffa2b9626b34c5`.
+
+The PowerShell entry point was tested with `pwsh` on macOS. Windows execution remains pending; these checks do not establish Windows display behavior.
+
 ## GUI alignment and resizing
 
 GUI checks used a dedicated frame and disposable buffers in a local development build of Emacs 31.1 on macOS / arm64. Existing key bindings and user settings were left unchanged. Lines containing tabs, Japanese text, and long context were displayed in two windows of different widths. Actual coordinates from `posn-at-point` and screenshots were inspected.

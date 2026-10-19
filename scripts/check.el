@@ -1,5 +1,8 @@
 ;;; check.el --- Check production sources -*- lexical-binding: t; -*-
 
+;; Author: Minoru Yasui
+;; Assisted-by: Codex:GPT-6.1
+
 ;; Run with: emacs -Q --batch -l scripts/check.el
 (require 'bytecomp)
 

@@ -1,6 +1,8 @@
 ;;; occur-kwic.el --- Align search matches vertically in context -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2025-2026 Minoru Yasui
+;; Author: Minoru Yasui
+;; Assisted-by: Codex:GPT-6.1
 ;; License: GPL-3+
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "27.1"))
