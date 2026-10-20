@@ -1,6 +1,6 @@
 # Implementation validation
 
-Recorded on 2026-10-20 for [occur-kwic.el](../occur-kwic.el), covering the initial 0.1.0 implementation and follow-up fixes and optimizations for 0.1.1. The sections retain the test counts and results at each stage. The legacy implementation remains unchanged.
+Recorded on 2026-10-20 for [occur-kwic.el](../occur-kwic.el), covering the initial 0.1.0 implementation, fixes and optimizations for 0.1.1, and context sorting for 0.2.0. The sections retain the test counts and results at each stage. The legacy implementation remains unchanged.
 
 ## Automated checks
 
@@ -352,6 +352,46 @@ changes, and standard Occur jumps to each source match's beginning. All 63
 batch tests completed as expected, including the two legacy expected failures.
 This passing regression covers data and navigation, not visual alignment.
 Bidirectional layout remains a known unresolved issue.
+
+## Context sorting in 0.2.0
+
+The first sorting implementation adds before/after N-word and N-character
+keys, match-string order, source-order restoration, independent case folding,
+and retention of the sort across refresh and cloning. The final word policy
+includes unmatched prefixes/suffixes as context units; it supersedes the
+exclusion policy in the early standalone probe.
+
+On Windows Emacs 31.1, the batch suite completed 76 tests with expected
+results, including the same two legacy expected failures. Production sources
+passed parentheses, loading and warning-free byte compilation. New regression
+coverage includes nearest-first keys, partial words, zero-width matches,
+accessible bounds, customized motion and subword boundaries, saved snapshots,
+stable original-order ties, case policy, refresh, cloning, multiple windows,
+navigation, invalid input, and rollback after an error or quit injected after
+text reordering. Word ranges are shared across matches from one source line.
+
+All five GUI tests passed in a dedicated process. The added test drives both
+real `s` prompts and checks `posn-at-point` after sorting/restoring rows in two
+windows of different widths, under all three alignments. Existing GUI
+regressions passed in the same run.
+
+A single interpreted benchmark used synthetic lines of the form
+`context MATCH wordNNNNN the rest of this line.` with varied numeric words.
+Collection figures average three complete collection/marker-cleanup runs;
+the comparison disables only word-span capture in the same build. Sort figures
+are one run per method, including key extraction, row reordering, offset repair
+and overlay rebuilding in one result window, with GC included. Actual GUI
+redisplay is excluded.
+
+| Lines | Collect without word capture | Collect with word capture | After 3 words | Before 10 characters | Restore source |
+| --- | --- | --- | --- | --- | --- |
+| 1,000 | 39 ms | 43 ms | 38 ms | 32 ms | 27 ms |
+| 10,000 | 633 ms | 758 ms | 406 ms | 328 ms | 253 ms |
+
+These local timings support the trial implementation, not a latency guarantee
+for arbitrary lines, custom callbacks or window counts. Initial source-order
+searches also pay the word-capture cost so snapshots retain the original word
+rules without reconstructing a source major mode later.
 
 ## Remaining verification
 

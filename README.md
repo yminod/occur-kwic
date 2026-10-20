@@ -51,6 +51,8 @@ At extremely narrow widths, there may be too little room for both the line-numbe
 | `g` | Search the source buffer again |
 | `a` | Choose left, center, or right alignment |
 | `v` | Toggle the current row's full text |
+| `s` | Choose a context, match-text, or source-order sort |
+| `S` | Toggle case-sensitive sorting and reapply the current sort |
 | `r` | Rename the result buffer based on its source |
 | `c` | Make an independent snapshot clone |
 | `q` | Quit the result window |
@@ -71,12 +73,118 @@ Incremental search (`C-s`, for example) temporarily reveals full text in every w
 
 Copying includes the selected underlying text, including hidden context and original tabs, without the display-only alignment padding.
 
+## Context sorting
+
+Press `s` (`M-x occur-kwic-sort`) and choose a method:
+
+| Method | Sort key |
+| --- | --- |
+| `after-words` / `before-words` | Up to N word units from the match edge, nearest first |
+| `after-characters` / `before-characters` | Up to N characters, nearest to the match first |
+| `match` | The matched string |
+| `source` | Restore original source order |
+
+Context sorts prompt for a positive N, initially 3, or reuse N from the active
+context sort. Word sorts compare the nearest unit first, then the second
+only when the first units are equal, and so on. Increasing N refines ties;
+rows whose order was already determined by the first unit keep that order.
+Each unit's characters are compared from its beginning in their normal order,
+including when sorting the preceding context.
+
+Word units follow the source buffer's Emacs word boundaries, starting at the
+exact edge of the match. If that edge cuts a word, the unmatched part counts
+as the first unit. For example, searching `cat` in `the cats sleep` produces
+the following key `("s" "sleep")` for N=2. Searching `\bcat\w*\b` matches
+`cats` as a whole and starts that key at `sleep`. A zero-width match inside a
+word leaves fragments on both sides. Word sorts can therefore compare both
+complete words and word fragments; they do not require a whole-word query.
+
+Character sorts include spaces, punctuation and word fragments. N counts Emacs
+characters, including combining characters separately, rather than bytes or
+screen columns. Only the preceding comparison key is reversed; displayed and
+copied text is preserved. All context stays within the saved accessible source
+line, and shorter equal-prefix keys come first. Equal keys always retain
+original source order, regardless of previous sorts.
+
+Sorting ignores case by default, independently of search case sensitivity.
+Press `S` to toggle this for the result buffer. The mode line shows the active
+sort, N and case policy. Sorting preserves the current row, expanded row and
+source navigation; widen a narrowed result buffer before sorting it.
+
+`g` re-collects the source and reapplies the chosen sort and case policy.
+Clones retain the sort and can be sorted independently. Existing snapshots
+keep their saved text and word boundaries even after source edits.
+
+Word boundaries use the source's syntax tables and word-motion settings,
+including `subword-mode`. Customize the buffer-local
+`occur-kwic-word-motion-function` in the **source** buffer to replace
+`forward-word`, then refresh the results. A replacement accepts a signed word
+count, moves forward to word ends and backward to word beginnings, returns
+non-nil after traversing a word and nil when no further word exists, respects
+narrowing, and does not edit text. Forward/backward boundaries must agree.
+Results capture and share the ranges once per source line; sorting does not
+run the callback again. Regexp `\b` does not necessarily follow customized
+motion boundaries, such as the internal boundaries of `subword-mode`.
+
+### Trying word sorting
+
+Open [examples/word-sorting.txt](examples/word-sorting.txt) in `text-mode`.
+The short sentences are constructed examples for exploring the controls.
+Search with `M-x occur-kwic`, entering `\blook\b` directly in the minibuffer,
+then press `s`, choose `after-words`, and enter `1`.
+
+The results group the expressions `look after`, `look at`, and `look for` in
+that order. This lets you inspect what follows a word across different uses.
+It does not assign grammatical categories or rank expressions by frequency.
+
+Choose `after-words` with N=3 next. The order within each group becomes:
+
+```text
+look after young children
+look at new maps
+look at old maps
+look for a job
+look for a room
+look for new clues
+```
+
+With N=1, all `look for` rows share the key `("for")` and retain source order.
+With N=3, `("for" "a" "job")` precedes `("for" "a" "room")`, and both
+precede `("for" "new" "clues")`. The `look after` and `look at` groups
+remain ahead of the `look for` group.
+
+For the preceding side, search `\bevidence\b` and select `before-words`, N=1.
+Results group `no evidence`, `strong evidence` (two rows), and `weak evidence`.
+Each preceding word is compared from its beginning; its letters stay in their
+ordinary order. Preceding character sorts instead compare the nearest
+character first, starting at word endings. Following word and character sorts
+can look similar when the character window contains enough text, but word
+counts use word boundaries and skip separators.
+
+For a partial query such as `ac`, the preceding first unit can be a fragment
+of the word containing the match or a complete word before it. Brackets below
+mark the matched text:
+
+| Text | `before-words`, N=1 key (ignoring case) |
+| --- | --- |
+| `callb[ac]k` | `callb` |
+| `can [ac]cumulate` | `can` |
+| `Char[ac]ter` | `char` |
+
+These sort in the order shown. N counts word units; their contents are still
+compared as strings. The text between the match and a word boundary is kept
+in the key, even when it is only part of a word.
+
+The current display highlights the match but does not mark the context keys.
+Start with N=1 and a whole-word query when checking the behavior; a partial
+query can make a word fragment the first key, as described above.
+
 ## Search behavior and scope
 
 - Search respects the source buffer's narrowing. An active region further restricts the search. Context outside those bounds is not included, even when a boundary falls inside a line.
 - A region does not restart line numbering. As in ordinary Occur, numbers are relative to the source buffer's accessible beginning before applying the region. Field text properties, such as prompt/input boundaries in shell buffers, do not split line context or count as newlines.
 - Case sensitivity follows `case-fold-search` and `search-upper-case`, as in ordinary Occur.
-- Results follow source order, with one row per non-overlapping match. There is no KWIC index sorting.
+- Results initially follow source order, with one row per non-overlapping match. Use `s` to sort them by context or matched text.
 - Zero-width matches use a display-only `|` marker. An empty regexp is rejected.
 - An actual match containing a newline raises an error and leaves previous results intact. Invalid regexps also leave previous results intact.
 - `g` tracks the original region with markers and applies the source buffer's current narrowing. If the two ranges no longer overlap, there are no matches. Source edits are not automatically synchronized into results.
@@ -117,6 +225,10 @@ even with equal-width glyphs. Search, stored text and source navigation have
 passed basic Hebrew and Arabic tests, but reliable alignment and cropping of
 bidirectional text are not currently supported. Fixing a paragraph's direction
 to left-to-right does not resolve reordering within a right-to-left run.
+
+See the [RTL and concordance research notes](docs/rtl-research.md) for measured
+layout experiments. Context sorting follows logical before/after positions
+and does not resolve the bidi display limitation.
 
 Use `occur-kwic-hook` for actions after a successful search. Mode initialization runs the parent `occur-mode-hook` and `occur-kwic-mode-hook`. The ordinary `occur-hook` is not run, since some of its functions assume ordinary line-based Occur output.
 
@@ -161,9 +273,17 @@ make check EMACS=/path/to/emacs  # Use a different Emacs
 
 The default run checks parentheses, loads both implementations, byte-compiles with warnings treated as errors, and runs ERT. Compilation uses a temporary directory and removes its artifacts. Test-only runs skip source checks and compilation.
 
-The batch suite has 63 tests: 46 passing tests for the new implementation, plus 17 legacy characterization tests with 15 passes and 2 expected failures. The expected failures record legacy tab alignment and zero-width search progress; separate passing tests cover the fixes in `occur-kwic`. A successful run reports `63 results as expected, 0 unexpected` and `2 expected failures`.
+The batch suite has 76 tests: 59 passing tests for `occur-kwic`, plus 17 legacy
+characterization tests with 15 passes and 2 expected failures. The expected
+failures record legacy tab alignment and zero-width search progress. A
+successful run reports `76 results as expected, 0 unexpected` and
+`2 expected failures`.
 
-Four additional GUI tests check actual pixel positions after redisplay, interactive alignment selection, horizontal scrolling, multiple windows, resizing, naming a clone with `C-u c`, and combining-character alignment with the source visible or hidden. Run them in a fresh GUI Emacs process, without `--batch`:
+Five additional GUI tests check actual pixel positions after redisplay,
+interactive alignment and sorting, horizontal scrolling, multiple windows,
+resizing, naming a clone with `C-u c`, and combining-character alignment with
+the source visible or hidden. Run them in a fresh GUI Emacs process, without
+`--batch`:
 
 ```sh
 emacs -Q -l scripts/run-gui-tests.el
@@ -171,15 +291,16 @@ emacs -Q -l scripts/run-gui-tests.el
 
 The runner exits that Emacs process when finished, with exit code 0 on success and nonzero on failure. It writes its log to `occur-kwic-gui-tests.log` in Emacs's temporary directory; set the `OCCUR_KWIC_GUI_TEST_LOG` environment variable to choose another log path. These tests assume the fresh frame's default fixed-width font. They have passed on Windows; rerunning them on macOS remains pending.
 
-- [New implementation tests](test/occur-kwic-tests.el): alignment, tabs and combining characters, full-text retention, multiple windows, resizing, search, navigation, refresh, cloning, and disabled editing.
-- [GUI tests](test/occur-kwic-gui-tests.el): alignment coordinates after actual redisplay, including scrolling regressions.
+- [Implementation tests](test/occur-kwic-tests.el): alignment, full-text retention, search, navigation, sorting and word boundaries, refresh, cloning, and disabled editing.
+- [GUI tests](test/occur-kwic-gui-tests.el): alignment coordinates after actual redisplay, including sorting and scrolling regressions.
 - [Legacy tests](test/eyegrep-tests.el): preserve observed strings, column positions, search bounds, and source targets. Legacy rounding and fixed offsets are comparison data rather than requirements for the redesign.
 - [Design](docs/occur-kwic-design.md): behavior and implementation decisions.
 - [Layout audit](docs/layout-audit.md): findings about the original implementation.
 - [Validation record](docs/implementation-checks.md): automated checks and GUI measurements.
+- [Concordance sorting research](docs/concordance-sorting-research.md): documented uses, scope decisions, and Emacs word-boundary and row-sorting probes.
 
 ## History and license
 
-`occur-kwic` grew out of [eyegrep.el](legacy/eyegrep.el), a personal tool I have used since around 2010 for displaying centered grep-like results in Emacs. The legacy file is preserved unchanged as a comparison baseline, with a short [history](legacy/README.md). Its 2025 copyright date does not mark the tool's origin; I tidied the surviving file that year. To try it, load it with `M-x load-file` and run `M-x eyegrep`.
+`occur-kwic` grew out of [eyegrep.el](legacy/eyegrep.el), a personal tool I have used since around 2010 for displaying centered grep-like results in Emacs. The legacy file is preserved unchanged as a comparison baseline, with a short [history](legacy/README.md).
 
-GNU GPL version 3 or later (GPL-3+). See [COPYING](COPYING). The original file carries Copyright (C) 2025 Minoru Yasui.
+GNU GPL version 3 or later (GPL-3+). See [COPYING](COPYING).

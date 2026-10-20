@@ -1,6 +1,6 @@
 # occur-kwic design
 
-This document describes occur-kwic 0.1.1 and its design decisions as of 2026-10-20. See the [user guide](../README.md) and [validation record](implementation-checks.md). The original [eyegrep.el](../legacy/eyegrep.el) is preserved unchanged with characterization tests.
+This document describes occur-kwic 0.2.0 and its design decisions as of 2026-10-20. See the [user guide](../README.md) and [validation record](implementation-checks.md). The original [eyegrep.el](../legacy/eyegrep.el) is preserved unchanged with characterization tests.
 
 ## Purpose and interface
 
@@ -13,6 +13,7 @@ Core requirements:
 - Full accessible source lines retained in result text; cropping and padding belong to the display layer.
 - Layout follows each result window's width, including when a buffer appears in several windows.
 - Occur-like navigation and refresh, with result editing explicitly disabled in the initial version.
+- Logical before/after N-word and N-character sorting, matched-text sorting, and source-order restoration.
 - Source narrowing respected; long matches cropped without wrapping; actual multiline matches rejected.
 
 ## Alignment model
@@ -41,6 +42,16 @@ runs intact and is insufficient. Reliable bidirectional alignment and cropping
 remain unresolved; disabling natural reading order is not a fix. Basic search,
 text retention and source navigation are covered separately by a passing test.
 
+The [RTL and concordance research](rtl-research.md) compares restricted layout
+prototypes and discusses logical character/word context keys, optional metadata
+providers, and the source-order invariants sorting must retain.
+It does not change this version's behavior or bidi support guarantee.
+
+The subsequent [concordance sorting research](concordance-sorting-research.md)
+motivates the implemented before/after word and character keys, match ordering
+and source-order restoration. Word boundaries remain defined by Emacs and user
+customization. The final policy includes unmatched word fragments as context.
+
 A match wider than the available area stays anchored and is clipped without wrapping. At extremely narrow widths, the prefix and anchor may no longer fit together, and a visible match cannot be guaranteed. Widening restores the ordinary view without changing the stored text.
 
 The [legacy layout audit](layout-audit.md) distinguishes stable ordinary-character placement from tab and search-loop problems. Legacy rounding and fixed offsets are useful comparison data, rather than requirements to reproduce every old coordinate.
@@ -58,9 +69,9 @@ The initial scope includes the active region. It excludes context-line prefix ar
 ## Stored data and display views
 
 Each match entry stores its source line number, match offsets within the line,
-source markers, and references to the full accessible line text and cumulative
-display columns. Matches on the same source line share that immutable text and
-column vector. The result buffer still contains a full copy of the line in each
+source markers, and references to the full accessible line text, cumulative
+display columns and word spans. Matches on the same source line share those
+immutable values. The result buffer still contains a full copy of the line in each
 match's separate result row.
 
 Collection visits matches in source order and keeps a single current-line
@@ -68,6 +79,40 @@ cache, reusing line boundaries, the line number, text, and column measurements
 until the next source line. Each search builds fresh line data, so refresh
 does not reuse stale source text. Match offsets, targets, and result-row
 positions remain separate for every entry.
+
+Word spans are captured during collection in the source buffer, restricted to
+the accessible line. The buffer-local `occur-kwic-word-motion-function` defaults
+to `forward-word`; callbacks use its signed-count and successful-movement return
+convention. Collecting once preserves mode-specific boundaries in snapshots
+without recreating a major mode or calling a changed source when sorting.
+Extracted keys clip intersecting spans at the match boundaries, so an unmatched
+prefix/suffix counts as the nearest word. Binary search locates that span;
+only up to N words are copied into each key.
+
+The sort operates on the exact match's context, divided by Emacs word
+boundaries. A unit can be a complete word or a fragment at the match edge;
+every unit is compared as a string in normal character order. Successive
+units only break ties between equal earlier units, so increasing N preserves
+the order of groups already distinguished by nearer units. Before-character
+sorting instead compares characters outward from the match, reversing their
+order in the comparison key. A partial query may consequently look different
+under word and character sorting without either operation requiring a
+whole-word match. The fragment-inclusive policy is retained for this version.
+
+`occur-kwic-sort` builds keys once, with source ordinals breaking every tie, and
+uses `sort-subr` to reorder result rows with their text properties. The canonical
+entry list remains in source/marker-creation order. A single row scan repairs
+integer offsets after sorting; source markers are unaffected. Window overlays
+are rebuilt, and point, window locations, expansion and the Occur arrow follow
+entry identity. An atomic change group rolls text back on error/quit; offset
+repair and overlay refresh also run after rollback. Narrowed result buffers
+must be widened before sorting so partial rows cannot become sorting records.
+
+The mode line records the current sort and case policy. Refresh retains both
+while re-collecting current source word boundaries. Clones copy the immutable
+sort specification and shared line data, with independent row identities and
+source markers as before. Key extraction remains separate from comparison and
+row reordering; external metadata providers are outside the implemented scope.
 
 Column measurements use `char-width` for each character, with tabs expanded
 separately at the source's tab stops. This avoids allocating a one-character

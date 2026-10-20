@@ -4,7 +4,7 @@
 ;; Author: Minoru Yasui
 ;; Assisted-by: Codex:GPT-6.1
 ;; License: GPL-3+
-;; Version: 0.1.1
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: matching, convenience
 
@@ -27,6 +27,7 @@
 ;; Text outside the viewport is hidden, not removed.  Occur navigation is
 ;; retained; editing results is intentionally unsupported.  Use `g' to
 ;; refresh, `a' to change alignment and `v' to show a complete result line.
+;; Use `s' to sort by context and `S' to toggle case-sensitive sorting.
 
 ;;; Code:
 
@@ -34,6 +35,7 @@
 (require 'replace)
 (require 'isearch)
 (require 'subr-x)
+(require 'sort)
 
 (defgroup occur-kwic nil
   "Search results with vertically aligned matches."
@@ -54,6 +56,25 @@ functions may assume an ordinary line-based Occur buffer."
   :type 'hook
   :group 'occur-kwic)
 
+(defcustom occur-kwic-word-motion-function #'forward-word
+  "Function used in the source buffer to collect word boundaries.
+Accept a signed word count, like `forward-word': positive moves to word
+ends, negative to word beginnings.  Return non-nil on successful movement,
+nil when no further word exists.  Respect narrowing and do not edit text.
+This option is buffer-local.  Word ranges are saved with search results;
+change it in the source and refresh results to use different boundaries."
+  :type 'function
+  :group 'occur-kwic)
+(make-variable-buffer-local 'occur-kwic-word-motion-function)
+
+(defcustom occur-kwic-sort-case-fold t
+  "Whether KWIC sorting ignores case, independently of search settings.
+Results inherit this buffer-local option from the source.  In a result
+buffer, use `occur-kwic-toggle-sort-case' to change it and sort again."
+  :type 'boolean
+  :group 'occur-kwic)
+(make-variable-buffer-local 'occur-kwic-sort-case-fold)
+
 (defcustom occur-kwic-output-size-warning-threshold (* 10 1024 1024)
   "Estimated result-text bytes above which a search asks to continue.
 The default is 10 MiB.  Nil disables the warning.  Each search, including
@@ -67,7 +88,7 @@ In batch mode, exceeding the threshold signals an error instead of asking."
   :group 'occur-kwic)
 
 (cl-defstruct (occur-kwic--entry (:constructor occur-kwic--entry-create))
-  line text columns begin end targets row-begin text-begin row-end)
+  line text columns words begin end targets row-begin text-begin row-end)
 (cl-defstruct (occur-kwic--view (:constructor occur-kwic--view-create))
   window width alignment overlays expanded)
 
@@ -79,6 +100,33 @@ In batch mode, exceeding the threshold signals an error instead of asking."
 (defvar-local occur-kwic--views nil)
 (defvar-local occur-kwic--expanded nil)
 (defvar-local occur-kwic--prefix-width 2)
+(defvar-local occur-kwic--sort-spec nil)
+
+(defun occur-kwic--word-spans (begin end)
+  "Capture word spans between BEGIN and END in the current source buffer.
+Return a vector of offset pairs, shared by matches on the same line."
+  (save-excursion
+    (save-restriction
+      (save-match-data
+        (narrow-to-region begin end)
+        (goto-char begin)
+        (let ((motion occur-kwic-word-motion-function)
+              (inhibit-field-text-motion t)
+              (buffer-read-only t)
+              spans done)
+          (while (and (not done) (< (point) end))
+            (let ((previous (point)))
+              (if (not (funcall motion 1))
+                  (setq done t)
+                (let ((stop (point)))
+                  (unless (> stop previous)
+                    (user-error "KWIC word motion did not move forward"))
+                  (funcall motion -1)
+                  (unless (and (>= (point) previous) (< (point) stop))
+                    (user-error "KWIC word motion returned inconsistent boundaries"))
+                  (push (cons (- (point) begin) (- stop begin)) spans)
+                  (goto-char stop)))))
+          (vconcat (nreverse spans)))))))
 
 (defun occur-kwic--columns (text tab-size)
   "Return cumulative display columns of TEXT, expanding tabs at TAB-SIZE."
@@ -137,7 +185,7 @@ to SOURCE's original accessible portion.  Do not change SOURCE."
                     (warning-threshold occur-kwic-output-size-warning-threshold)
                     (text-bytes 0) (match-count 0)
                     entries complete done
-                    cached-begin cached-end cached-line cached-text cached-columns
+                    cached-begin cached-end cached-line cached-text cached-columns cached-words
                     cached-bytes cached-row-overhead)
                 (narrow-to-region start limit)
                 (goto-char start)
@@ -156,7 +204,7 @@ to SOURCE's original accessible portion.  Do not change SOURCE."
                                   cached-end (save-excursion
                                                (goto-char begin) (line-end-position))
                                   cached-line (+ line-offset (line-number-at-pos begin))
-                                  cached-text nil cached-columns nil
+                                  cached-text nil cached-columns nil cached-words nil
                                   cached-bytes nil
                                   cached-row-overhead (+ 2 (length (number-to-string cached-line)))))
                           (when (> end cached-end)
@@ -182,12 +230,14 @@ to SOURCE's original accessible portion.  Do not change SOURCE."
                                   (occur-kwic--confirm-output-size bytes)
                                   (setq warning-threshold nil))))
                             (unless cached-columns
-                              (setq cached-columns (occur-kwic--columns cached-text tab-size)))
+                              (setq cached-columns (occur-kwic--columns cached-text tab-size)
+                                    cached-words (occur-kwic--word-spans cached-begin cached-end)))
                             ;; Register both markers before a pending quit
                             ;; can interrupt; only this small allocation is atomic.
                             (let ((inhibit-quit t))
                               (push (occur-kwic--entry-create
                                      :line cached-line :text cached-text :columns cached-columns
+                                     :words cached-words
                                      :begin (- begin cached-begin) :end (- end cached-begin)
                                      :targets (list (cons (copy-marker begin)
                                                           (copy-marker end t))))
@@ -441,6 +491,169 @@ horizontal scroll, even when reselecting the current alignment."
   (dolist (view occur-kwic--views)
     (set-window-hscroll (occur-kwic--view-window view) 0)))
 
+(defun occur-kwic--sort-key (entry kind count)
+  "Extract ENTRY's logical context key for KIND and COUNT.
+Keys contain strings, nearest to the match first.  A word intersecting
+the match contributes only its unmatched prefix or suffix."
+  (let* ((text (occur-kwic--entry-text entry))
+         (begin (occur-kwic--entry-begin entry))
+         (end (occur-kwic--entry-end entry))
+         (before (memq kind '(before-words before-characters)))
+         (boundary (if before begin end))
+         key)
+    (pcase kind
+      ('source nil)
+      ('match (setq key (list (substring text begin end))))
+      ((or 'before-characters 'after-characters)
+       (let ((part (if before (substring text (max 0 (- begin count)) begin)
+                     (substring text end (min (length text) (+ end count))))))
+         (setq key (list (if before (concat (reverse (string-to-list part))) part)))))
+      ((or 'before-words 'after-words)
+       (let* ((spans (occur-kwic--entry-words entry))
+              (low 0) (high (length spans)))
+         ;; Find the last start before BEGIN or the first end after END.
+         (while (< low high)
+           (let* ((middle (/ (+ low high) 2)) (span (aref spans middle)))
+             (if (if before (< (car span) boundary) (<= (cdr span) boundary))
+                 (setq low (1+ middle))
+               (setq high middle))))
+         (let ((index (if before (1- low) low)))
+           (while (and (> count 0) (>= index 0) (< index (length spans)))
+             (let ((span (aref spans index)))
+               (push (substring text (if before (car span) (max end (car span)))
+                                (if before (min begin (cdr span)) (cdr span))) key))
+             (setq index (+ index (if before -1 1)) count (1- count))))
+         (setq key (nreverse key)))))
+    (if occur-kwic-sort-case-fold (mapcar #'downcase key) key)))
+
+(defun occur-kwic--sort-less-p (left right)
+  "Compare LEFT and RIGHT (string-tuple . source-ordinal) keys."
+  (let ((a (car left)) (b (car right)))
+    (while (and a b (equal (car a) (car b)))
+      (setq a (cdr a) b (cdr b)))
+    (cond ((and a b) (string-lessp (car a) (car b)))
+          (a nil) (b t)
+          (t (< (cdr left) (cdr right))))))
+
+(defun occur-kwic--row-location (position)
+  "Describe POSITION by entry identity and row offset, or header position."
+  (save-excursion
+    (goto-char position)
+    (let ((entry (occur-kwic--entry-at-point)))
+      (if entry (cons entry (- position (occur-kwic--entry-row-begin entry)))
+        position))))
+
+(defun occur-kwic--location-position (location)
+  "Resolve a saved row LOCATION after sorting."
+  (if (consp location)
+      (min (occur-kwic--entry-row-end (car location))
+           (+ (occur-kwic--entry-row-begin (car location)) (cdr location)))
+    location))
+
+(defun occur-kwic--reorder (keys)
+  "Sort result rows using precomputed KEYS, retaining entry ownership.
+Preserve point, window locations, expansion and the Occur arrow by entry.
+Rollback text on an error or quit, then rebuild row offsets and overlays."
+  (let ((location (occur-kwic--row-location (point)))
+        (arrow (and (markerp overlay-arrow-position)
+                    (eq (marker-buffer overlay-arrow-position) (current-buffer))
+                    (occur-kwic--row-location overlay-arrow-position)))
+        (windows (mapcar (lambda (window)
+                           (list window
+                                 (occur-kwic--row-location (window-point window))
+                                 (occur-kwic--row-location (window-start window))))
+                         (get-buffer-window-list (current-buffer) nil t)))
+        (modified (buffer-modified-p))
+        (inhibit-read-only t)
+        (inhibit-modification-hooks t)
+        (buffer-undo-list t))
+    (unwind-protect
+        (progn
+          (dolist (view occur-kwic--views)
+            (setf (occur-kwic--view-width view) nil)
+            (occur-kwic--delete-view view))
+          (save-restriction
+            (goto-char (point-min))
+            (forward-line 1)
+            (narrow-to-region (point) (point-max))
+            (atomic-change-group
+              (sort-subr nil #'forward-line #'end-of-line
+                         (lambda () (gethash (occur-kwic--entry-at-point) keys))
+                         nil #'occur-kwic--sort-less-p))))
+      ;; A sort moves text properties, but cannot maintain integer offsets
+      ;; or result-local markers.  Repair after success AND after rollback.
+      (let ((inhibit-quit t))
+        (goto-char (point-min))
+        (forward-line 1)
+        (while (< (point) (point-max))
+          (let ((entry (occur-kwic--entry-at-point)))
+            (setf (occur-kwic--entry-row-begin entry) (point)
+                  (occur-kwic--entry-text-begin entry) (+ (point) occur-kwic--prefix-width)
+                  (occur-kwic--entry-row-end entry) (line-end-position)))
+          (forward-line 1))
+        (goto-char (occur-kwic--location-position location))
+        (when arrow
+          (set-marker overlay-arrow-position (occur-kwic--location-position arrow)))
+        (dolist (state windows)
+          (set-window-start (car state) (occur-kwic--location-position (nth 2 state)) t)
+          (set-window-point (car state) (occur-kwic--location-position (nth 1 state))))
+        (set-buffer-modified-p modified)
+        (occur-kwic--refresh-windows)))))
+
+(defun occur-kwic-sort (kind &optional count)
+  "Sort KWIC results by KIND, with up to COUNT context units.
+KIND is `before-words', `after-words', `before-characters',
+`after-characters', `match' or `source'.  Context keys compare nearest
+units first.  Words cut by the match contribute their remaining fragment,
+counted as one unit.  Character keys include spaces and punctuation;
+COUNT counts Emacs characters, not display columns or grapheme clusters.
+Context stays within the saved accessible source line.  Equal keys always
+retain original source order.  Use `occur-kwic-sort-case-fold' for case.
+Interactively prompt for KIND and COUNT (default 3).  `source' restores
+the original order.  Widen a narrowed result buffer before sorting."
+  (interactive
+   (let* ((kind (intern (completing-read
+                        "Sort KWIC: " '("after-words" "before-words" "after-characters"
+                                        "before-characters" "match" "source")
+                        nil t nil nil (symbol-name (or (car occur-kwic--sort-spec)
+                                                       'after-words)))))
+          (count (when (memq kind '(before-words after-words before-characters after-characters))
+                   (read-number (if (memq kind '(before-words after-words))
+                                    "Number of words: " "Number of characters: ")
+                                (or (cadr occur-kwic--sort-spec) 3)))))
+     (list kind count)))
+  (unless (derived-mode-p 'occur-kwic-mode) (user-error "Not a KWIC result buffer"))
+  (when (buffer-narrowed-p) (user-error "Widen KWIC results before sorting"))
+  (unless (memq kind '(before-words after-words before-characters after-characters match source))
+    (user-error "Invalid KWIC sort: %S" kind))
+  (when (memq kind '(before-words after-words before-characters after-characters))
+    (unless (and (integerp count) (> count 0))
+      (user-error "KWIC context count must be a positive integer")))
+  (let ((keys (make-hash-table :test #'eq)) (ordinal 0))
+    ;; Extract every key before changing result text.  The canonical list
+    ;; remains in source/marker-creation order even after repeated sorts.
+    (dolist (entry occur-kwic--entries)
+      (puthash entry (cons (occur-kwic--sort-key entry kind count) ordinal) keys)
+      (setq ordinal (1+ ordinal)))
+    (occur-kwic--reorder keys))
+  (setq occur-kwic--sort-spec (unless (eq kind 'source) (list kind count))
+        mode-line-process (unless (eq kind 'source)
+                            (format " [%s%s; %s]" kind (if count (format " %d" count) "")
+                                    (if occur-kwic-sort-case-fold "ignore case" "case sensitive"))))
+  (force-mode-line-update))
+
+(defun occur-kwic-toggle-sort-case ()
+  "Toggle case folding and reapply the current KWIC sort."
+  (interactive)
+  (let ((previous occur-kwic-sort-case-fold) complete)
+    (unwind-protect
+        (progn
+          (setq-local occur-kwic-sort-case-fold (not previous))
+          (apply #'occur-kwic-sort (or occur-kwic--sort-spec '(source)))
+          (setq complete t)
+          (message "KWIC sorting %s case" (if occur-kwic-sort-case-fold "ignores" "distinguishes")))
+      (unless complete (setq occur-kwic-sort-case-fold previous)))))
+
 (defun occur-kwic--no-edit ()
   "Explain why result editing is unavailable."
   (interactive)
@@ -461,6 +674,8 @@ horizontal scroll, even when reselecting the current alignment."
   (let ((map (make-sparse-keymap)))
     (define-key map "a" #'occur-kwic-set-alignment)
     (define-key map "v" #'occur-kwic-toggle-line)
+    (define-key map "s" #'occur-kwic-sort)
+    (define-key map "S" #'occur-kwic-toggle-sort-case)
     (define-key map "e" #'occur-kwic--no-edit)
     (define-key map "n" #'next-error-no-select)
     (define-key map "p" #'previous-error-no-select)
@@ -479,6 +694,8 @@ horizontal scroll, even when reselecting the current alignment."
     ["Display occurrence" occur-mode-display-occurrence t]
     ["Alignment..." occur-kwic-set-alignment t]
     ["Toggle full line" occur-kwic-toggle-line t]
+    ["Sort..." occur-kwic-sort t]
+    ["Ignore case in sort" occur-kwic-toggle-sort-case :style toggle :selected occur-kwic-sort-case-fold]
     ["Edit results (unsupported)" occur-kwic--no-edit nil]
     ["Refresh" revert-buffer t]
     ["Quit" quit-window t]))
@@ -486,7 +703,8 @@ horizontal scroll, even when reselecting the current alignment."
 (put 'occur-kwic-mode 'no-clone-indirect t)
 (define-derived-mode occur-kwic-mode occur-mode "Occur KWIC"
   "Occur navigation with one KWIC row per match.
-Use `a' for alignment, `v' for a full line, and `g' to search again.
+Use `a' for alignment, `v' for a full line, `s' to sort, `S' to toggle
+case-sensitive sorting, and `g' to search again with the same sort.
 Result editing is unsupported; edit the source buffer instead."
   (setq-local truncate-lines t)
   (setq-local auto-hscroll-mode nil)
@@ -518,6 +736,7 @@ SOURCE, REGEXP, CASE-FOLD, REGION and ALIGNMENT describe the search."
                         (cons (copy-marker (car region))
                               (copy-marker (cdr region) t)))))
     (setq-local occur-kwic-alignment alignment)
+    (setq-local occur-kwic-sort-case-fold (buffer-local-value 'occur-kwic-sort-case-fold source))
     (setq default-directory (buffer-local-value 'default-directory source))
     (setq occur-kwic--prefix-width
           (1+ (length (number-to-string (occur-kwic--entry-line (car (last entries)))))))
@@ -571,9 +790,10 @@ SOURCE, REGEXP, CASE-FOLD, REGION and ALIGNMENT describe the search."
       (set-buffer-modified-p nil))
     buffer))
 
-(defun occur-kwic--run (source regexp case-fold region alignment &optional buffer)
+(defun occur-kwic--run (source regexp case-fold region alignment &optional buffer sort-settings)
   "Search SOURCE and display KWIC results, optionally reusing BUFFER.
-REGEXP, CASE-FOLD, REGION and ALIGNMENT specify the search and layout."
+REGEXP, CASE-FOLD, REGION and ALIGNMENT specify the search and layout.
+SORT-SETTINGS, if non-nil, is (SORT-SPEC CASE-FOLD) retained on refresh."
   (unless (and (stringp regexp) (not (string-empty-p regexp)))
     (user-error "KWIC requires a nonempty regexp"))
   (unless (buffer-live-p source) (user-error "The source buffer has been killed"))
@@ -603,6 +823,10 @@ REGEXP, CASE-FOLD, REGION and ALIGNMENT specify the search and layout."
                 (setq buffer (or buffer (get-buffer-create "*Occur KWIC*"))))
               (setq started t)
               (occur-kwic--populate buffer entries source regexp case-fold region alignment)
+              (when sort-settings
+                (with-current-buffer buffer
+                  (setq-local occur-kwic-sort-case-fold (cadr sort-settings))
+                  (apply #'occur-kwic-sort (or (car sort-settings) '(source)))))
               (display-buffer buffer)
               (with-current-buffer buffer (occur-kwic--refresh-windows))
               (setq complete t))
@@ -616,9 +840,10 @@ REGEXP, CASE-FOLD, REGION and ALIGNMENT specify the search and layout."
       buffer)))
 
 (defun occur-kwic--revert (_ignore-auto _noconfirm)
-  "Rerun the stored search, preserving this result buffer's name and alignment."
+  "Rerun the stored search, preserving its name, alignment and sorting."
   (occur-kwic--run occur-kwic--source occur-kwic--regexp occur-kwic--case-fold
-                   occur-kwic--region occur-kwic-alignment (current-buffer)))
+                   occur-kwic--region occur-kwic-alignment (current-buffer)
+                   (list occur-kwic--sort-spec occur-kwic-sort-case-fold)))
 
 (defun occur-kwic-clone-buffer ()
   "Clone this result snapshot using standard buffer cloning support.

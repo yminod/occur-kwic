@@ -19,8 +19,7 @@ I learned that this display resembles KWIC (Key Word In Context).
 I developed the original tool without knowing about KWIC. The redesign aims to
 improve the Emacs experience and interoperability with standard tools.
 
-To inspect the old behavior, load this directory's `eyegrep.el` with
-`M-x load-file`, then run `M-x eyegrep`. This is historical code with known
-limitations: see the [layout audit](../docs/layout-audit.md), including the
-nonterminating search for some zero-width matches. Its behavior is retained
-for comparison, rather than as requirements for the new implementation.
+This is historical code with known limitations: see the
+[layout audit](../docs/layout-audit.md), including the nonterminating search
+for some zero-width matches. Its behavior is retained for comparison,
+rather than as requirements for the new implementation.

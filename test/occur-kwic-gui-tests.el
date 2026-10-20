@@ -133,4 +133,32 @@
         (occur-kwic-gui-test--check-anchors
          (get-buffer-window-list result nil t) 'right)))))
 
+(ert-deftest occur-kwic-gui-test-interactive-sort-keeps-anchors-after-reordering ()
+  (skip-unless (display-graphic-p))
+  (occur-kwic-test--with-results
+      ("z XXX zebra\nalpha XXX apple\nmiddle XXX banana\n" "XXX")
+    (delete-other-windows)
+    (let* ((first (selected-window))
+           (second (split-window-right 31))
+           (windows (list first second)))
+      (set-window-buffer second result)
+      (should (eq (key-binding "s") #'occur-kwic-sort))
+      ;; Exercise both real minibuffer prompts, including the numeric one.
+      (let ((minibuffer-setup-hook
+             (cons (lambda ()
+                     (delete-minibuffer-contents)
+                     (insert (if (string-prefix-p "Number" (minibuffer-prompt))
+                                 "1" "after-words"))
+                     (setq unread-command-events (cons ?\r unread-command-events)))
+                   minibuffer-setup-hook)))
+        (call-interactively (key-binding "s")))
+      (should (equal (occur-kwic-test--display-order) '(2 3 1)))
+      (dolist (alignment '(left center right))
+        (occur-kwic-gui-test--choose-alignment alignment)
+        (occur-kwic-gui-test--check-anchors windows alignment)
+        (occur-kwic-sort 'source)
+        (occur-kwic-gui-test--check-anchors windows alignment)
+        (occur-kwic-sort 'after-words 1)
+        (occur-kwic-gui-test--check-anchors windows alignment)))))
+
 ;;; occur-kwic-gui-tests.el ends here
