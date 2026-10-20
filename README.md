@@ -273,11 +273,17 @@ make check EMACS=/path/to/emacs  # Use a different Emacs
 
 The default run checks parentheses, loads both implementations, byte-compiles with warnings treated as errors, and runs ERT. Compilation uses a temporary directory and removes its artifacts. Test-only runs skip source checks and compilation.
 
-The batch suite has 76 tests: 59 passing tests for `occur-kwic`, plus 17 legacy
+The batch suite has 82 tests: 65 passing tests for `occur-kwic`, plus 17 legacy
 characterization tests with 15 passes and 2 expected failures. The expected
 failures record legacy tab alignment and zero-width search progress. A
-successful run reports `76 results as expected, 0 unexpected` and
+successful run reports `82 results as expected, 0 unexpected` and
 `2 expected failures`.
+
+Six of these are [literary excerpt regressions](test/fixtures/README.md), using
+fixed local text from *Alice's Adventures in Wonderland* and 『坊っちゃん』.
+They check exact match locations and sort orders, distinguish matches on the
+same line, and exercise navigation, case policies, source-order restoration,
+refresh and independent clones. They require no network access.
 
 Five additional GUI tests check actual pixel positions after redisplay,
 interactive alignment and sorting, horizontal scrolling, multiple windows,
@@ -292,6 +298,7 @@ emacs -Q -l scripts/run-gui-tests.el
 The runner exits that Emacs process when finished, with exit code 0 on success and nonzero on failure. It writes its log to `occur-kwic-gui-tests.log` in Emacs's temporary directory; set the `OCCUR_KWIC_GUI_TEST_LOG` environment variable to choose another log path. These tests assume the fresh frame's default fixed-width font. They have passed on Windows; rerunning them on macOS remains pending.
 
 - [Implementation tests](test/occur-kwic-tests.el): alignment, full-text retention, search, navigation, sorting and word boundaries, refresh, cloning, and disabled editing.
+- [Literary excerpt tests](test/occur-kwic-corpus-tests.el): fixed English and Japanese examples with documented sources and independently reviewed expectations.
 - [GUI tests](test/occur-kwic-gui-tests.el): alignment coordinates after actual redisplay, including sorting and scrolling regressions.
 - [Legacy tests](test/eyegrep-tests.el): preserve observed strings, column positions, search bounds, and source targets. Legacy rounding and fixed offsets are comparison data rather than requirements for the redesign.
 - [Design](docs/occur-kwic-design.md): behavior and implementation decisions.

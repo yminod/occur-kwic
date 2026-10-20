@@ -1,2 +1,5 @@
 # Keep the POSIX entry point runnable after a Windows checkout.
 *.sh text eol=lf
+
+# Corpus digests and character offsets use the checked-in UTF-8/LF text.
+test/fixtures/*.txt text eol=lf

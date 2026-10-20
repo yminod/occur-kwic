@@ -16,7 +16,7 @@
   (add-to-list 'load-path (expand-file-name "legacy" root))
   (unless test-only
     (load (expand-file-name "scripts/check.el" root) nil t t))
-  (dolist (name '("eyegrep-tests.el" "occur-kwic-tests.el"))
+  (dolist (name '("eyegrep-tests.el" "occur-kwic-tests.el" "occur-kwic-corpus-tests.el"))
     (load (expand-file-name name (expand-file-name "test" root)) nil t t))
   (ert-run-tests-batch-and-exit))
 

@@ -393,6 +393,45 @@ for arbitrary lines, custom callbacks or window counts. Initial source-order
 searches also pay the word-capture cost so snapshots retain the original word
 rules without reconstructing a source major mode later.
 
+## Literary excerpt regressions
+
+Six batch regressions use fixed excerpts from Lewis Carroll's *Alice's
+Adventures in Wonderland* (Project Gutenberg #11, first six prose paragraphs
+of Chapter I) and 夏目漱石『坊っちゃん』 (青空文庫・作品752, first three prose
+paragraphs of chapter 一). The UTF-8/LF fixtures are local, digest-checked,
+and documented in [test/fixtures/README.md](../test/fixtures/README.md), with
+source URLs, extraction rules, attribution, and reviewed word-key tables.
+Tests require no network access.
+
+Fixed line/character-offset/text triples identify 20 Alice matches for
+`\b[Ss]he\b` and 12 Botchan matches for `から`. They distinguish multiple
+occurrences on the same physical line. Expectations were prepared from the
+source text and direct Emacs word motion without using occur-kwic's cached
+spans, key extraction, comparison, or result output as the oracle.
+
+The tests check complete stored rows, exact source marker ranges and standard
+Occur jumps for every expected row; all six sort methods; N=1 and N=3 for
+context methods; both sort case policies; repeated sorts; equal-key source
+order; and exact restoration of the original result text. Separate Alice
+queries check search case folding and uppercase smart-case behavior.
+Refresh/clone checks insert a leading source newline, verify shifted targets
+in an unchanged snapshot, refresh the sorted original with the saved case
+policy, and keep the independently sorted clone usable after closing the
+original.
+
+On Windows Emacs 31.1, the six new tests passed. The normal PowerShell entry
+point completed all 82 batch tests with expected results, including the two
+existing legacy expected failures. Parentheses, source loading, and
+warning-free production byte compilation also passed. No production changes
+were required. The additional tests cover data and navigation; the GUI tests
+were not rerun for this test-only change.
+
+Three temporary fault injections were also detected by the new tests:
+redirecting a target to another match on the same line, omitting the original
+source ordinal when comparing equal keys, and dropping sort/case settings
+during refresh. Those injections were scoped to disposable test processes;
+they are not part of the implementation or normal test suite.
+
 ## Remaining verification
 
 Older Emacs versions, terminal Emacs, proportional fonts, and complex emoji sequences have not yet been checked in actual display sessions. Emacs 27.1 is the declared minimum, with runtime compatibility verification still pending. No claim of a full compatibility matrix is made by the current checks.
