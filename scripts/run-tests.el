@@ -13,6 +13,7 @@
     (error "Usage: emacs -Q --batch -l scripts/run-tests.el [--test-only]"))
   (setq command-line-args-left nil)
   (add-to-list 'load-path root)
+  (add-to-list 'load-path (expand-file-name "legacy" root))
   (unless test-only
     (load (expand-file-name "scripts/check.el" root) nil t t))
   (dolist (name '("eyegrep-tests.el" "occur-kwic-tests.el"))

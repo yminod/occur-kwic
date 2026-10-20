@@ -4,7 +4,7 @@
 ;; Author: Minoru Yasui
 ;; Assisted-by: Codex:GPT-6.1
 ;; License: GPL-3+
-;; Version: 0.1.0
+;; Version: 0.1.1
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: matching, convenience
 
@@ -54,6 +54,18 @@ functions may assume an ordinary line-based Occur buffer."
   :type 'hook
   :group 'occur-kwic)
 
+(defcustom occur-kwic-output-size-warning-threshold (* 10 1024 1024)
+  "Estimated result-text bytes above which a search asks to continue.
+The default is 10 MiB.  Nil disables the warning.  Each search, including
+refresh, asks at most once.  Declining preserves previous results.
+The estimate includes repeated source lines, line-number prefixes and
+newlines in Emacs's internal multibyte representation, but excludes the
+header and metadata.  This is a warning threshold, not a memory limit;
+markers, text properties and display data require additional memory.
+In batch mode, exceeding the threshold signals an error instead of asking."
+  :type '(choice (const :tag "Do not warn" nil) (natnum :tag "Bytes"))
+  :group 'occur-kwic)
+
 (cl-defstruct (occur-kwic--entry (:constructor occur-kwic--entry-create))
   line text columns begin end targets row-begin text-begin row-end)
 (cl-defstruct (occur-kwic--view (:constructor occur-kwic--view-create))
@@ -73,61 +85,118 @@ functions may assume an ordinary line-based Occur buffer."
   (let ((columns (make-vector (1+ (length text)) 0))
         (column 0))
     (dotimes (index (length text))
-      (setq column (+ column (if (= (aref text index) ?\t)
-                                 (- tab-size (% column tab-size))
-                               (string-width (substring text index (1+ index))))))
+      (let ((character (aref text index)))
+        (setq column (+ column (if (= character ?\t)
+                                   (- tab-size (% column tab-size))
+                                 (char-width character)))))
       (aset columns (1+ index) column))
     columns))
 
-(defun occur-kwic--release-entries (entries)
-  "Release source markers belonging to ENTRIES."
-  (dolist (entry entries)
-    (dolist (target (occur-kwic--entry-targets entry))
-      (set-marker (car target) nil)
-      (set-marker (cdr target) nil))))
+(defun occur-kwic--release-entries (entries &optional newest-first)
+  "Release source markers belonging to ENTRIES, newest markers first.
+ENTRIES are in source order unless NEWEST-FIRST is non-nil.  Do not
+modify their lists: callers may still hold references to them."
+  ;; Emacs unlinks a marker by scanning its buffer's marker chain, which
+  ;; has newly created markers at the front.  Oldest-first removal makes
+  ;; even an otherwise isolated result's cleanup quadratic.
+  (let ((inhibit-quit t))
+    (dolist (entry (if newest-first entries (reverse entries)))
+      (dolist (target (reverse (occur-kwic--entry-targets entry)))
+        (set-marker (cdr target) nil)
+        (set-marker (car target) nil)))))
+
+(defun occur-kwic--confirm-output-size (bytes)
+  "Ask whether to continue generating at least BYTES of result text.
+Signal quit on refusal, or a user error in batch mode."
+  (when noninteractive
+    (user-error
+     "KWIC result text exceeds the size warning threshold; adjust `occur-kwic-output-size-warning-threshold' to continue"))
+  (unless (yes-or-no-p
+           (format (concat "KWIC result text already needs about %.1f MiB, plus metadata; "
+                           "Emacs may slow down or run out of memory.  Continue? ")
+                   (/ bytes 1048576.0)))
+    (signal 'quit nil)))
 
 (defun occur-kwic--collect (source regexp case-fold region)
   "Collect SOURCE matches for REGEXP under CASE-FOLD within REGION.
-REGION is nil or a pair of source positions.  Do not change SOURCE."
+REGION is nil or a pair of source positions.  Keep line numbers relative
+to SOURCE's original accessible portion.  Do not change SOURCE."
   (with-current-buffer source
     (save-excursion
       (save-restriction
         (save-match-data
-          (when region
-            (narrow-to-region (max (point-min) (car region))
-                              (min (point-max) (cdr region))))
-          (goto-char (point-min))
-          (let ((case-fold-search case-fold)
-                (limit (point-max))
-                (tab-size (max 1 tab-width))
-                entries complete done)
-            (unwind-protect
-                (progn
-                  (while (and (not done) (< (point) limit)
-                              (re-search-forward regexp limit t))
-                    (let* ((begin (match-beginning 0))
-                           (end (match-end 0))
-                           (line-begin (save-excursion
-                                         (goto-char begin) (line-beginning-position)))
-                           (line-end (save-excursion
-                                       (goto-char begin) (line-end-position))))
-                      (when (> end line-end)
-                        (user-error "KWIC does not support matches containing a newline"))
-                      ;; A final newline does not create an extra result line.
-                      (unless (and (= begin end limit) (eq (char-before limit) ?\n))
-                        (let ((text (buffer-substring-no-properties line-begin line-end)))
-                          (push (occur-kwic--entry-create
-                                 :line (line-number-at-pos begin)
-                                 :text text :columns (occur-kwic--columns text tab-size)
-                                 :begin (- begin line-begin) :end (- end line-begin)
-                                 :targets (list (cons (copy-marker begin)
-                                                      (copy-marker end t))))
-                                entries)))
-                      (when (= begin end)
-                        (if (< (point) limit) (forward-char 1) (setq done t)))))
-                  (setq complete t)
-                  (nreverse entries))
-              (unless complete (occur-kwic--release-entries entries)))))))))
+          (let ((start (if region (max (point-min) (car region)) (point-min)))
+                (limit (if region (min (point-max) (cdr region)) (point-max))))
+            ;; `narrow-to-region' accepts reversed endpoints, so an empty
+            ;; intersection must be handled before changing the restriction.
+            (when (< start limit)
+              (let ((line-offset (1- (line-number-at-pos start)))
+                    (inhibit-field-text-motion t)
+                    (case-fold-search case-fold)
+                    (tab-size (max 1 tab-width))
+                    (warning-threshold occur-kwic-output-size-warning-threshold)
+                    (text-bytes 0) (match-count 0)
+                    entries complete done
+                    cached-begin cached-end cached-line cached-text cached-columns
+                    cached-bytes cached-row-overhead)
+                (narrow-to-region start limit)
+                (goto-char start)
+                (unwind-protect
+                    (progn
+                      (while (and (not done) (< (point) limit)
+                                  (re-search-forward regexp limit t))
+                        (let ((begin (match-beginning 0))
+                              (end (match-end 0)))
+                          ;; Matches arrive in source order, so one cached
+                          ;; line is enough.  Cache only immutable line data;
+                          ;; match offsets and source markers remain per entry.
+                          (when (or (null cached-end) (> begin cached-end))
+                            (setq cached-begin (save-excursion
+                                                 (goto-char begin) (line-beginning-position))
+                                  cached-end (save-excursion
+                                               (goto-char begin) (line-end-position))
+                                  cached-line (+ line-offset (line-number-at-pos begin))
+                                  cached-text nil cached-columns nil
+                                  cached-bytes nil
+                                  cached-row-overhead (+ 2 (length (number-to-string cached-line)))))
+                          (when (> end cached-end)
+                            (user-error "KWIC does not support matches containing a newline"))
+                          ;; A final newline does not create an extra result line.
+                          (unless (and (= begin end limit) (eq (char-before limit) ?\n))
+                            (unless cached-text
+                              (setq cached-text (buffer-substring-no-properties
+                                                 cached-begin cached-end)))
+                            (when warning-threshold
+                              (unless cached-bytes
+                                ;; Inserting unibyte text into the multibyte
+                                ;; result also expands non-ASCII raw bytes.
+                                (setq cached-bytes
+                                      (string-bytes (if (multibyte-string-p cached-text)
+                                                        cached-text
+                                                      (string-to-multibyte cached-text)))))
+                              (setq text-bytes (+ text-bytes cached-bytes)
+                                    match-count (1+ match-count))
+                              ;; A larger line number widens ALL row prefixes.
+                              (let ((bytes (+ text-bytes (* match-count cached-row-overhead))))
+                                (when (> bytes warning-threshold)
+                                  (occur-kwic--confirm-output-size bytes)
+                                  (setq warning-threshold nil))))
+                            (unless cached-columns
+                              (setq cached-columns (occur-kwic--columns cached-text tab-size)))
+                            ;; Register both markers before a pending quit
+                            ;; can interrupt; only this small allocation is atomic.
+                            (let ((inhibit-quit t))
+                              (push (occur-kwic--entry-create
+                                     :line cached-line :text cached-text :columns cached-columns
+                                     :begin (- begin cached-begin) :end (- end cached-begin)
+                                     :targets (list (cons (copy-marker begin)
+                                                          (copy-marker end t))))
+                                    entries)))
+                          (when (= begin end)
+                            (if (< (point) limit) (forward-char 1) (setq done t)))))
+                      (setq complete t)
+                      (nreverse entries))
+                  (unless complete (occur-kwic--release-entries entries t)))))))))))
 
 (defun occur-kwic--delete-view (view)
   "Remove the display overlays for VIEW."
@@ -136,16 +205,95 @@ REGION is nil or a pair of source positions.  Do not change SOURCE."
 
 (defun occur-kwic--cleanup ()
   "Release this result buffer's private markers and overlays."
-  (mapc #'occur-kwic--delete-view occur-kwic--views)
-  (occur-kwic--release-entries occur-kwic--entries)
-  (when occur-kwic--region
-    (set-marker (car occur-kwic--region) nil)
-    (set-marker (cdr occur-kwic--region) nil))
-  (setq occur-kwic--views nil occur-kwic--entries nil occur-kwic--region nil))
+  (let ((inhibit-quit t))
+    (mapc #'occur-kwic--delete-view occur-kwic--views)
+    (when occur-kwic--region
+      (set-marker (cdr occur-kwic--region) nil)
+      (set-marker (car occur-kwic--region) nil))
+    (occur-kwic--release-entries occur-kwic--entries)
+    ;; Cleanup also runs before mode initialization in a fresh buffer.
+    ;; Do not touch the shared arrow belonging to another Occur buffer.
+    (when (local-variable-p 'overlay-arrow-position)
+      (when (and (markerp overlay-arrow-position)
+                 (eq (marker-buffer overlay-arrow-position) (current-buffer)))
+        (set-marker overlay-arrow-position nil))
+      (setq overlay-arrow-position nil))
+    (setq occur-kwic--views nil occur-kwic--entries nil occur-kwic--region nil
+          occur-kwic--expanded nil)))
+
+(defun occur-kwic--discard-result (buffer entries &optional newest-first)
+  "Discard incomplete BUFFER and release its collected ENTRIES.
+NEWEST-FIRST has the same meaning as in `occur-kwic--release-entries'."
+  (let ((inhibit-quit t))
+    (occur-kwic--release-entries entries newest-first)
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (when (eq occur-kwic--entries entries) (setq occur-kwic--entries nil))
+        (occur-kwic--cleanup)
+        ;; This is generated, incomplete output, including on failed refresh.
+        (set-buffer-modified-p nil)
+        (let ((kill-buffer-query-functions nil)) (kill-buffer buffer))))))
 
 (defun occur-kwic--entry-at-point ()
   "Return the result entry on the current line, or nil."
   (get-text-property (line-beginning-position) 'occur-kwic-entry))
+
+(defun occur-kwic--clone-state ()
+  "Give a standard buffer clone its own KWIC markers and display state.
+Run in the clone via `clone-buffer-hook', after its text and buffer-local
+variables have been copied.  Never clean up the borrowed original state."
+  (let ((entries occur-kwic--entries)
+        (region occur-kwic--region)
+        (expanded occur-kwic--expanded)
+        (arrow overlay-arrow-position)
+        (modified (buffer-modified-p))
+        complete
+        (newest-first t))
+    ;; Drop borrowed ownership before allocating or changing anything.
+    (setq occur-kwic--views nil occur-kwic--entries nil
+          occur-kwic--region nil occur-kwic--expanded (eq expanded t)
+          overlay-arrow-position nil)
+    (unwind-protect
+        (progn
+          (when (markerp arrow)
+            (setq overlay-arrow-position (copy-marker (marker-position arrow))))
+          (when region
+            (let ((inhibit-quit t))
+              (setq occur-kwic--region (cons (copy-marker (car region))
+                                            (copy-marker (cdr region) t)))))
+          (dolist (entry entries)
+            (let ((inhibit-quit t)
+                  (copy (copy-occur-kwic--entry entry)))
+              (setf (occur-kwic--entry-targets copy)
+                    (mapcar (lambda (target)
+                              (cons (copy-marker (car target))
+                                    (copy-marker (cdr target) t)))
+                            (occur-kwic--entry-targets entry)))
+              ;; Register each completed copy, so a quit between entries
+              ;; still leaves an owned list for cleanup.
+              (push copy occur-kwic--entries)
+              (when (eq expanded entry) (setq occur-kwic--expanded copy))))
+          (let ((inhibit-quit t))
+            (setq occur-kwic--entries (nreverse occur-kwic--entries)
+                  newest-first nil))
+          (let ((inhibit-read-only t)
+                (inhibit-modification-hooks t)
+                (buffer-undo-list t))
+            (unwind-protect
+                (save-restriction
+                  (widen)
+                  (dolist (entry occur-kwic--entries)
+                    (add-text-properties
+                     (occur-kwic--entry-row-begin entry) (1+ (occur-kwic--entry-row-end entry))
+                     `(occur-kwic-entry ,entry
+                       occur-target ,(if (fboundp 'occur--targets-start)
+                                         (occur-kwic--entry-targets entry)
+                                       (caar (occur-kwic--entry-targets entry)))))))
+              (set-buffer-modified-p modified)))
+          (occur-kwic--refresh-windows)
+          (setq complete t))
+      (unless complete
+        (occur-kwic--discard-result (current-buffer) occur-kwic--entries newest-first)))))
 
 (defun occur-kwic--bound (columns column upper)
   "Binary search COLUMNS for COLUMN.
@@ -185,23 +333,24 @@ column for Emacs's truncation/continuation indicator."
 
 (defun occur-kwic--overlay (view begin end &rest properties)
   "Add to VIEW an overlay from BEGIN to END with PROPERTIES."
-  (let ((overlay (make-overlay begin end nil t nil)))
+  (let (overlay)
+    (let ((inhibit-quit t))
+      (setq overlay (make-overlay begin end nil t nil))
+      (push overlay (occur-kwic--view-overlays view)))
     (overlay-put overlay 'window (occur-kwic--view-window view))
     (overlay-put overlay 'occur-kwic t)
     (while properties
       (overlay-put overlay (pop properties) (pop properties)))
-    (push overlay (occur-kwic--view-overlays view))
     overlay))
 
 (defun occur-kwic--draw-view (view)
   "Rebuild VIEW without changing result text or source markers."
+  ;; Invalidate before deleting old overlays, since deletion can quit too.
+  (setf (occur-kwic--view-width view) nil)
   (occur-kwic--delete-view view)
   (let* ((window (occur-kwic--view-window view))
          (width (window-body-width window))
          (expanded occur-kwic--expanded))
-    (setf (occur-kwic--view-width view) width
-          (occur-kwic--view-alignment view) occur-kwic-alignment
-          (occur-kwic--view-expanded view) expanded)
     (unless expanded (set-window-hscroll window 0))
     (dolist (entry occur-kwic--entries)
       (unless (or (eq expanded t) (eq expanded entry))
@@ -224,10 +373,19 @@ column for Emacs's truncation/continuation indicator."
         (let ((position (+ (occur-kwic--entry-text-begin entry)
                            (occur-kwic--entry-begin entry))))
           (occur-kwic--overlay view position (1+ position)
-                               'before-string (propertize "|" 'face list-matching-lines-face)))))))
+                               'before-string (propertize "|" 'face list-matching-lines-face)))))
+    ;; Only a fully drawn view may satisfy the layout cache.
+    (setf (occur-kwic--view-width view) width
+          (occur-kwic--view-alignment view) occur-kwic-alignment
+          (occur-kwic--view-expanded view) expanded)))
 
 (defun occur-kwic--refresh-windows (&optional _changed-window)
   "Maintain independent display state for each window showing this buffer."
+  ;; Cropped rows already fit their windows.  In particular, a cursor in
+  ;; the uncropped header must not scroll all those rows away at redisplay.
+  ;; Full-line views need ordinary scrolling so isearch can expose point.
+  (setq-local auto-hscroll-mode
+              (and occur-kwic--expanded (default-value 'auto-hscroll-mode)))
   (let ((windows (get-buffer-window-list (current-buffer) nil t)))
     (dolist (view (copy-sequence occur-kwic--views))
       (unless (memq (occur-kwic--view-window view) windows)
@@ -267,14 +425,21 @@ other windows, so temporarily expose the text in every result window."
     (occur-kwic--refresh-windows)))
 
 (defun occur-kwic-set-alignment (alignment)
-  "Align match starts, centers or ends according to ALIGNMENT."
+  "Align match starts, centers or ends according to ALIGNMENT.
+Return expanded rows to KWIC display and reset every result window's
+horizontal scroll, even when reselecting the current alignment."
   (interactive
    (list (intern (completing-read "Align match: " '("left" "center" "right")
                                   nil t nil nil (symbol-name occur-kwic-alignment)))))
   (unless (memq alignment '(left center right))
     (user-error "Invalid KWIC alignment: %S" alignment))
   (setq-local occur-kwic-alignment alignment)
-  (occur-kwic--refresh-windows))
+  (setq occur-kwic--expanded nil)
+  (occur-kwic--refresh-windows)
+  ;; A cached view need not be redrawn when the same alignment is chosen.
+  ;; Its scroll position still needs resetting.
+  (dolist (view occur-kwic--views)
+    (set-window-hscroll (occur-kwic--view-window view) 0)))
 
 (defun occur-kwic--no-edit ()
   "Explain why result editing is unavailable."
@@ -301,9 +466,6 @@ other windows, so temporarily expose the text in every result window."
     (define-key map "p" #'previous-error-no-select)
     (define-key map [remap occur-edit-mode] #'occur-kwic--no-edit)
     (define-key map [remap occur-rename-buffer] #'occur-kwic-rename-buffer)
-    ;; Generic cloning shares private marker/cache objects.  Provide a
-    ;; snapshot clone below instead.
-    (define-key map [remap clone-buffer] #'occur-kwic-clone-buffer)
     (define-key map [menu-bar occur] 'undefined)
     map)
   "Keymap for `occur-kwic-mode'.")
@@ -321,12 +483,15 @@ other windows, so temporarily expose the text in every result window."
     ["Refresh" revert-buffer t]
     ["Quit" quit-window t]))
 
+(put 'occur-kwic-mode 'no-clone-indirect t)
 (define-derived-mode occur-kwic-mode occur-mode "Occur KWIC"
   "Occur navigation with one KWIC row per match.
 Use `a' for alignment, `v' for a full line, and `g' to search again.
 Result editing is unsupported; edit the source buffer instead."
   (setq-local truncate-lines t)
+  (setq-local auto-hscroll-mode nil)
   (setq-local display-line-numbers nil)
+  (setq-local overlay-arrow-position nil)
   (setq-local buffer-read-only t)
   (setq-local revert-buffer-function #'occur-kwic--revert)
   (add-to-invisibility-spec 'occur-kwic)
@@ -337,6 +502,7 @@ Result editing is unsupported; edit the source buffer instead."
   (add-hook 'isearch-mode-end-hook #'occur-kwic--isearch-end nil t)
   (add-hook 'change-major-mode-hook #'occur-kwic--check-mode-change nil t)
   (add-hook 'change-major-mode-hook #'occur-kwic--cleanup t t)
+  (add-hook 'clone-buffer-hook #'occur-kwic--clone-state nil t)
   (add-hook 'kill-buffer-hook #'occur-kwic--cleanup nil t))
 
 (defun occur-kwic--populate (buffer entries source regexp case-fold region alignment)
@@ -411,6 +577,7 @@ REGEXP, CASE-FOLD, REGION and ALIGNMENT specify the search and layout."
   (unless (and (stringp regexp) (not (string-empty-p regexp)))
     (user-error "KWIC requires a nonempty regexp"))
   (unless (buffer-live-p source) (user-error "The source buffer has been killed"))
+  (when (eq buffer source) (user-error "Source and result buffers must differ"))
   (unless (memq alignment '(left center right))
     (user-error "Invalid KWIC alignment: %S" alignment))
   ;; Collect first: a regexp error or multiline match leaves old results intact.
@@ -425,18 +592,24 @@ REGEXP, CASE-FOLD, REGION and ALIGNMENT specify the search and layout."
             (when (and (buffer-live-p old) (not (eq old source))) (kill-buffer old)))
           (message "No matches for %S" regexp)
           nil)
-      (unless buffer
-        (setq buffer (get-buffer "*Occur KWIC*"))
-        (when (eq buffer source)
-          (with-current-buffer buffer (rename-buffer "*Occur KWIC source*" t))
-          (setq buffer nil))
-        (setq buffer (or buffer (get-buffer-create "*Occur KWIC*"))))
-      (occur-kwic--populate buffer entries source regexp case-fold region alignment)
-      (display-buffer buffer)
-      (with-current-buffer buffer
-        (occur-kwic--refresh-windows)
-        (setq next-error-last-buffer buffer)
-        (run-hooks 'occur-kwic-hook))
+      (let (started complete)
+        (unwind-protect
+            (progn
+              (unless buffer
+                (setq buffer (get-buffer "*Occur KWIC*"))
+                (when (eq buffer source)
+                  (with-current-buffer buffer (rename-buffer "*Occur KWIC source*" t))
+                  (setq buffer nil))
+                (setq buffer (or buffer (get-buffer-create "*Occur KWIC*"))))
+              (setq started t)
+              (occur-kwic--populate buffer entries source regexp case-fold region alignment)
+              (display-buffer buffer)
+              (with-current-buffer buffer (occur-kwic--refresh-windows))
+              (setq complete t))
+          (unless complete
+            (occur-kwic--discard-result (and started buffer) entries))))
+      (setq next-error-last-buffer buffer)
+      (with-current-buffer buffer (run-hooks 'occur-kwic-hook))
       (let ((print-escape-newlines t))
         (message "%d match%s for %S" (length entries)
                  (if (= (length entries) 1) "" "es") regexp))
@@ -448,29 +621,12 @@ REGEXP, CASE-FOLD, REGION and ALIGNMENT specify the search and layout."
                    occur-kwic--region occur-kwic-alignment (current-buffer)))
 
 (defun occur-kwic-clone-buffer ()
-  "Clone this result snapshot without sharing mutable markers or overlays."
+  "Clone this result snapshot using standard buffer cloning support.
+Interactively honor the standard prefix argument for naming the clone."
   (interactive)
-  (unless (buffer-live-p occur-kwic--source)
-    (user-error "The source buffer has been killed"))
-  (let ((buffer (generate-new-buffer (buffer-name)))
-        (entries (mapcar (lambda (entry)
-                           (let ((copy (copy-occur-kwic--entry entry)))
-                             (setf (occur-kwic--entry-targets copy)
-                                   (mapcar (lambda (target)
-                                             (cons (copy-marker (car target))
-                                                   (copy-marker (cdr target) t)))
-                                           (occur-kwic--entry-targets entry)))
-                             copy))
-                         occur-kwic--entries)))
-    (occur-kwic--populate buffer entries occur-kwic--source occur-kwic--regexp
-                          occur-kwic--case-fold
-                          (and occur-kwic--region
-                               (cons (marker-position (car occur-kwic--region))
-                                     (marker-position (cdr occur-kwic--region))))
-                          occur-kwic-alignment)
-    (pop-to-buffer buffer)
-    (occur-kwic--refresh-windows)
-    buffer))
+  (if (called-interactively-p 'interactive)
+      (call-interactively #'clone-buffer)
+    (clone-buffer nil t)))
 
 ;;;###autoload
 (defun occur-kwic (regexp &optional region)

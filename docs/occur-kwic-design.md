@@ -1,12 +1,10 @@
 # occur-kwic design
 
-This document records the initial implementation and its design decisions as of 2026-10-20. See the [user guide](../README.md) and [validation record](implementation-checks.md). The original [eyegrep.el](../eyegrep.el) is preserved unchanged with characterization tests.
+This document describes occur-kwic 0.1.1 and its design decisions as of 2026-10-20. See the [user guide](../README.md) and [validation record](implementation-checks.md). The original [eyegrep.el](../legacy/eyegrep.el) is preserved unchanged with characterization tests.
 
 ## Purpose and interface
 
 The package aligns search results by their matches to make surrounding context easier to compare with less horizontal eye movement. It uses KWIC (Key Word In Context) presentation with familiar Occur navigation. The plain description matters alongside the term “KWIC”: someone looking for grep-like output with matches lined up vertically should be able to recognize the tool without knowing that term.
-
-The Emacs package is an independent project named `occur-kwic`. A future CLI is outside this repository's scope.
 
 Core requirements:
 
@@ -31,6 +29,18 @@ Left alignment places match starts together at the window midpoint. Right alignm
 
 Layout is measured in display columns, rather than character counts. An odd-width match in center alignment rounds its start to the right. Ordinary full-width characters and combining marks are covered by tests. Tabs use the source's `tab-width`, expanded from the start of the accessible source line. Pixel-perfect behavior with proportional fonts and complex emoji sequences is outside the current guarantee.
 
+The column model assumes Emacs's logical widths agree with actual glyph advances. Font selection, Unicode East Asian Width, and Emacs's language and character-width settings can disagree, including for ambiguous-width characters. Misalignment can therefore occur even with monospaced fonts and accumulate across the displayed context. This is a display limitation; source text and stored result text remain intact. Automatic width validation, font adjustment, and character-width correction are outside the package's scope.
+
+The layout also assumes logical character order corresponds to horizontal
+position. Bidirectional reordering breaks this assumption independently of
+glyph widths: a match inside a right-to-left run may be positioned according
+to context logically after it. Hebrew and Arabic GUI checks have reproduced
+different match positions across rows, despite equal-width glyphs. Forcing
+`bidi-paragraph-direction` to `left-to-right` leaves reordering within those
+runs intact and is insufficient. Reliable bidirectional alignment and cropping
+remain unresolved; disabling natural reading order is not a fix. Basic search,
+text retention and source navigation are covered separately by a passing test.
+
 A match wider than the available area stays anchored and is clipped without wrapping. At extremely narrow widths, the prefix and anchor may no longer fit together, and a visible match cannot be guaranteed. Widening restores the ordinary view without changing the stored text.
 
 The [legacy layout audit](layout-audit.md) distinguishes stable ordinary-character placement from tab and search-loop problems. Legacy rounding and fixed offsets are useful comparison data, rather than requirements to reproduce every old coordinate.
@@ -47,7 +57,48 @@ The initial scope includes the active region. It excludes context-line prefix ar
 
 ## Stored data and display views
 
-Each match entry stores its source line number, full accessible line text, cumulative display columns, match offsets within the line, and source markers. Several matches on one source line duplicate that line's text in separate result rows.
+Each match entry stores its source line number, match offsets within the line,
+source markers, and references to the full accessible line text and cumulative
+display columns. Matches on the same source line share that immutable text and
+column vector. The result buffer still contains a full copy of the line in each
+match's separate result row.
+
+Collection visits matches in source order and keeps a single current-line
+cache, reusing line boundaries, the line number, text, and column measurements
+until the next source line. Each search builds fresh line data, so refresh
+does not reuse stale source text. Match offsets, targets, and result-row
+positions remain separate for every entry.
+
+Column measurements use `char-width` for each character, with tabs expanded
+separately at the source's tab stops. This avoids allocating a one-character
+substring for every width lookup. It also avoids asking automatic composition
+to measure a combining mark in isolation: on GUI Emacs, that could count an
+accent as a spacing character even when it follows a base character in the
+source. Widths still follow the buffer's display table and `char-width-table`.
+This remains a character-column model, without measurement of whole shaped
+clusters or font-specific pixel advances. Sharing avoids repeated line-width
+calculation and column-vector allocation.
+The full result text can still grow quadratically when a long line has many
+matches, because that line is inserted once per match.
+
+Collection estimates result-row bytes before constructing output. The
+`occur-kwic-output-size-warning-threshold` option defaults to 10 MiB; nil
+disables it. Above the threshold, an interactive confirmation explains the
+possible slowdown or memory exhaustion. Refusal or quit follows collection's
+cleanup path and preserves previous results. Acceptance disables further size
+confirmations for that search; refresh starts a fresh estimate. Batch searches
+signal a user error instead of prompting.
+
+The running estimate sums each repeated line's multibyte byte count and the
+line-number prefixes and newlines for all entries so far. A larger source line
+number widens every prefix, so its overhead is applied to all collected rows.
+Each source line's byte count is cached alongside its text; unibyte lines are
+measured after conversion to the result's multibyte representation. The check
+precedes allocation of the crossing entry's markers and, for a newly encountered
+line, its column vector. After acceptance or with warnings disabled, byte
+counting is skipped. The header and metadata are excluded. This is an early
+warning based on accumulated output, not a match-count cap, total-memory limit,
+or prediction of the final size.
 
 “Full line” means the portion inside the source buffer's accessible search bounds. Collection does not widen the source to retrieve context outside narrowing or a selected region.
 
@@ -61,6 +112,39 @@ Lifecycle rules:
 - `g` searches the source again and replaces the snapshot.
 - Views no longer showing the result release their overlays. Killing or replacing results releases private markers and overlays.
 - Cloning creates an independent snapshot with separate mutable markers and display state.
+
+Source markers are detached in reverse creation order, including each pair's
+end marker before its start marker. Collection's partial list is already in
+that order; completed result lists are traversed in reverse without changing
+their cons cells. This avoids repeatedly scanning past the result's own newer
+markers in Emacs's marker chain. Unrelated live markers in the source can
+still add scanning cost, so cleanup is not guaranteed to be linear in every
+buffer configuration.
+
+Generation retains a cleanup path for all collected entries until population
+and the first layout complete. Failure during collection preserves previous
+results. Failure after output construction begins discards the incomplete
+result buffer, including a buffer being refreshed; it does not restore the
+previous snapshot. Cleanup also releases region and private navigation-arrow
+markers and clears expanded-row references. It leaves shared navigation arrows
+belonging to other buffers alone. Clone entries acquire ownership incrementally,
+so interrupted cloning can discard its partial copies without touching the
+original's markers or overlays.
+
+Overlay allocation is registered with its view before properties are assigned.
+A view's cache is invalidated before deleting old overlays and updated only
+after drawing completes. An interrupted redraw can therefore be retried without
+orphaning overlays or accepting an incomplete layout as current.
+
+Both `c` and `M-x clone-buffer` use standard `clone-buffer`, with a buffer-local
+`clone-buffer-hook` that detaches KWIC state. The hook copies entries and source
+markers, copies region markers, rebinds result text properties to the copied
+entries, and drops borrowed view caches without deleting the original overlays.
+Each snapshot has its own navigation arrow. Immutable source text and column
+vectors can remain shared. Standard cloning preserves point, mark, narrowing,
+and naming behavior; expansion is mapped to the corresponding copied entry.
+The `no-clone-indirect` mode property rejects ordinary indirect cloning commands,
+whose shared text is incompatible with independently refreshed snapshots.
 
 Both automated tests and GUI checks cover differently sized windows and resizing. Large-result performance and older-version behavior still need broader verification.
 
@@ -76,7 +160,11 @@ The initial version therefore keeps results read-only, disables the edit key and
 
 ### Narrowing and regions
 
-Search and context collection stay inside the source's accessible bounds, further restricted by an active region. Region endpoints are retained as markers. Refresh combines those tracked endpoints with the source's current narrowing.
+Search and context collection stay inside the source's accessible bounds, further restricted by an active region. Region endpoints are retained as markers. Refresh combines those tracked endpoints with the source's current narrowing. An empty or disjoint intersection produces no matches; reversed intersection endpoints must not be passed to `narrow-to-region`, which would search the gap between the two ranges.
+
+Line numbers are relative to the source's accessible beginning before applying the region, matching ordinary Occur. Collection records a line offset before its temporary narrowing so selecting a region does not restart numbering. Source narrowing still defines the numbering origin.
+
+Collection binds `inhibit-field-text-motion` so line boundaries follow actual newlines and search bounds rather than `field` properties. Prompt/input fields in shell or REPL buffers therefore neither crop context nor cause a match spanning a field boundary to be rejected as multiline. This does not widen the search bounds or modify the source's field properties.
 
 Visual cropping is separate from narrowing. Copying selected result text includes hidden context and original tabs, but no display padding. Narrowing the result buffer restricts copying and searching in the normal Emacs way.
 
@@ -96,6 +184,8 @@ Zero-width matches explicitly advance the search. Their position is shown with a
 ### Incremental search and full-line display
 
 `v` toggles a row's full text. During incremental search, all rows are revealed; afterward the final result row remains expanded. Full-line expansion applies to every window showing that result buffer because Emacs's buffer-level invisibility checks also inspect invisible overlays for other windows. Revealing only the selected window was insufficient and failed a GUI search check. Ordinary cropped KWIC views remain independent by window width.
+
+Choosing an alignment returns every row to KWIC display and resets horizontal scrolling in all result windows, including when the same alignment is selected again. Cropped display disables automatic horizontal scrolling: the uncropped header can otherwise make redisplay scroll the entire window after layout has already reset its scroll position. Expanded views use the global `auto-hscroll-mode` setting so incremental search and cursor movement can expose full-line context. Scroll reset on alignment selection is independent of the layout cache.
 
 ## Sources consulted
 

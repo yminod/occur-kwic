@@ -1,6 +1,6 @@
 # Legacy eyegrep layout audit
 
-Recorded on 2026-10-20. The original [eyegrep.el](../eyegrep.el) is unchanged. The author's experience of stable alignment in normal use serves as a comparison baseline for the redesign.
+Recorded on 2026-10-20. The original [eyegrep.el](../legacy/eyegrep.el) is unchanged. My experience of stable alignment in normal use serves as a comparison baseline for the redesign.
 
 ## Method and scope
 
@@ -14,7 +14,7 @@ The ordinary-character layout formula was also swept over text widths from 20 to
 - At a text width of 30 columns, `X` following different lengths of ordinary full-width text started at column 15 in both cases.
 - With three-digit line numbers, a two-column match in an 80-column window had its center at column 41. This is a fixed bias from the geometric midpoint, separate from stability across rows.
 
-These observations support the author's report of stable ordinary-character alignment. They do not justify treating the original layout formula as generally incorrect.
+These observations are consistent with the stable ordinary-character alignment I saw in normal use. They do not justify treating the original layout formula as generally incorrect.
 
 ## Tabs in the left context
 
@@ -27,7 +27,7 @@ X tail
 
 `string-width` measured the generated prefix before `X` as 15 columns in both rows. In the actual result buffer, `current-column` reported 8 and 15. A tab's standalone width differs from its advance to the next tab stop at a particular position.
 
-The author confirmed that tabs had not been considered. The redesign retains original tabs in the underlying text and displays their source-line expansion, using the source's `tab-width` from the start of the accessible line.
+I had not accounted for tabs in the original implementation. The redesign retains original tabs in the underlying text and displays their source-line expansion, using the source's `tab-width` from the start of the accessible line.
 
 ## Oversized matches
 

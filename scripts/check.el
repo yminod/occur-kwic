@@ -9,8 +9,9 @@
 (let* ((root (expand-file-name ".." (file-name-directory load-file-name)))
        (temporary-directory (make-temp-file "occur-kwic-check-" t)))
   (unwind-protect
-      (dolist (name '("eyegrep" "occur-kwic"))
-        (let* ((source (expand-file-name (concat name ".el") root))
+      (dolist (relative-source '("legacy/eyegrep.el" "occur-kwic.el"))
+        (let* ((name (file-name-base relative-source))
+               (source (expand-file-name relative-source root))
                (temporary-source (expand-file-name (concat name ".el") temporary-directory)))
           (with-temp-buffer
             (insert-file-contents source)
